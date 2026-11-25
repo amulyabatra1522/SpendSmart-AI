@@ -13,12 +13,12 @@ from datetime import date, datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_MODEL = "gpt-6-astra"
+DEFAULT_MODEL = "gemini-3.8-flash"
 CATEGORIES = {"Food", "Transport", "Shopping", "Education", "Health", "Entertainment", "Bills", "Other"}
 
 
@@ -139,11 +139,11 @@ def finance_context(payload: dict) -> tuple[dict, list[dict]]:
     return context, txs
 
 
-def call_openai(question: str, context: dict, history: object) -> str:
+def call_gemini(question: str, context: dict, history: object) -> str:
     config = settings()
-    api_key = config.get("OPENAI_API_KEY", "").strip()
+    api_key = config.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not configured. Add it to your local .env file and restart the server.")
+        raise RuntimeError("GEMINI_API_KEY is not configured. Add your Google AI Studio key to the local .env file and restart the server.")
     safe_history = []
     if isinstance(history, list):
         for turn in history[-6:]:
@@ -162,36 +162,46 @@ def call_openai(question: str, context: dict, history: object) -> str:
         "Explain that comparisons and projections depend on recorded data. Do not request passwords, UPI PINs, or card details. "
         "This is educational budgeting help, not professional investment, tax, credit, or legal advice."
     )
+    model = config.get("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     body = json.dumps({
-        "model": config.get("OPENAI_MODEL", DEFAULT_MODEL),
-        "instructions": instructions,
-        "input": json.dumps(prompt, ensure_ascii=False),
-        "max_output_tokens": 320,
-        "store": False,
+        "systemInstruction": {"parts": [{"text": instructions}]},
+        "contents": [{"role": "user", "parts": [{"text": json.dumps(prompt, ensure_ascii=False)}]}],
+        "generationConfig": {"maxOutputTokens": 320},
     }).encode("utf-8")
     request = Request(
-        "https://api.openai.com/v1/responses",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model, safe='')}:generateContent",
         data=body,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
         method="POST",
     )
     try:
         with urlopen(request, timeout=45) as response:
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
-        raise RuntimeError(f"OpenAI API request failed (HTTP {error.code}). Check the key, model access, and API account." ) from None
-    except (URLError, TimeoutError):
-        raise RuntimeError("Could not reach the OpenAI API. Check the server’s internet connection and try again.") from None
-    text = result.get("output_text")
+        try:
+            detail = json.loads(error.read().decode("utf-8")).get("error", {}).get("message", "")
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+            detail = ""
+        suffix = f": {str(detail)[:240]}" if detail else ""
+        raise RuntimeError(f"Gemini returned HTTP {error.code}{suffix}") from None
+    except URLError as error:
+        reason = error.reason
+        if isinstance(reason, OSError):
+            detail = reason.strerror or type(reason).__name__
+        else:
+            detail = str(reason)[:160] or type(reason).__name__
+        raise RuntimeError(f"Could not connect to Gemini: {detail}. Check DNS, firewall, proxy, and outbound access to generativelanguage.googleapis.com:443.") from None
+    except TimeoutError:
+        raise RuntimeError("The connection to generativelanguage.googleapis.com timed out before Gemini replied. Allow outbound HTTPS (port 443) for the Python server, and check any firewall, VPN, or proxy settings.") from None
+    candidates = result.get("candidates", [])
+    text = "\n".join(
+        part.get("text", "")
+        for candidate in candidates[:1]
+        for part in candidate.get("content", {}).get("parts", [])
+        if isinstance(part.get("text"), str)
+    ).strip()
     if not text:
-        text = "\n".join(
-            part.get("text", "")
-            for item in result.get("output", [])
-            for part in item.get("content", [])
-            if part.get("type") == "output_text"
-        ).strip()
-    if not text:
-        raise RuntimeError("The AI service returned no text. Please try again.")
+        raise RuntimeError("Gemini returned no answer. Check the model response and try again.")
     return str(text)[:5000]
 
 
@@ -424,9 +434,9 @@ class SpendSmartHandler(SimpleHTTPRequestHandler):
         if urlsplit(self.path).path == "/api/status":
             config = settings()
             return self.send_json(200, {
-                "provider": "OpenAI",
-                "configured": bool(config.get("OPENAI_API_KEY", "").strip()),
-                "model": config.get("OPENAI_MODEL", DEFAULT_MODEL),
+                "provider": "Google Gemini",
+                "configured": bool(config.get("GEMINI_API_KEY", "").strip()),
+                "model": config.get("GEMINI_MODEL", DEFAULT_MODEL),
             })
         return super().do_GET()
 
@@ -444,8 +454,15 @@ class SpendSmartHandler(SimpleHTTPRequestHandler):
                 if not question:
                     return self.send_json(400, {"error": "Ask a question first."})
                 context, txs = finance_context(payload)
-                answer_text = call_openai(question, context, payload.get("history"))
-                return self.send_json(200, {"answer": answer_text, "records": len(txs), "model": settings().get("OPENAI_MODEL", DEFAULT_MODEL)})
+                answer_text = call_gemini(question, context, payload.get("history"))
+                return self.send_json(200, {"answer": answer_text, "records": len(txs), "model": settings().get("GEMINI_MODEL", DEFAULT_MODEL), "provider": "Google Gemini"})
+            if route == "/api/doctor/health":
+                answer_text = call_gemini(
+                    "Reply with exactly: Gemini connection is working.",
+                    {"currency": "INR", "records_in_context": 0},
+                    [],
+                )
+                return self.send_json(200, {"answer": answer_text, "model": settings().get("GEMINI_MODEL", DEFAULT_MODEL), "provider": "Google Gemini"})
             if route == "/api/ml/category":
                 clean = sanitize_transactions(payload.get("transactions"))
                 result = train_category_model(clean, str(payload.get("description", ""))[:120])
@@ -467,7 +484,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8001"))
     server = ThreadingHTTPServer(("127.0.0.1", port), SpendSmartHandler)
     print(f"SpendSmart is running at http://127.0.0.1:{port}")
-    print("GenAI API key:", "configured" if settings().get("OPENAI_API_KEY", "").strip() else "not configured")
+    print("Gemini API key:", "configured" if settings().get("GEMINI_API_KEY", "").strip() else "not configured")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -38,6 +38,6 @@ An unusual amount is not evidence of fraud. There is only one injected anomaly i
 | `GET /api/ml/demo` | Reproducible synthetic training/evaluation for presentation |
 | `POST /api/ml/category` | Fit a category model on browser labels and classify a new description |
 | `POST /api/ml/anomalies` | Fit an anomaly model to browser expense amounts |
-| `POST /api/doctor` | Send consented transaction context through the local server to OpenAI; separate from the ML models |
+| `POST /api/doctor` | Send consented transaction context through the local server to Google Gemini; separate from the ML models |
 
 The server binds to `127.0.0.1`. ML is recalculated on request from the supplied data; this prototype does not persist model weights or train on external financial datasets.
